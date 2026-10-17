@@ -525,7 +525,6 @@ func makeListener(bind: String, port: UInt16) -> Int32? {
 //  隐私：带 Concealed / Transient 标记的剪贴板（密码管理器、临时内容）一律不同步。
 // =====================================================================
 let clipMaxBytes = 8 * 1024 * 1024      // 单个文件/图片上限
-let clipMaxTotal = 16 * 1024 * 1024     // 一次多文件的总量上限（对端也按 16 MiB 压）
 let clipMaxText  = 100_000              // 文本上限（字符）
 var clipSyncEnabled = true
 var clipLastChange = -1                 // 上一次看到的 changeCount
@@ -537,11 +536,6 @@ var clipLastSentPrint = ""
 var clipSends = 0
 var clipRecvs = 0
 
-func clipReceiveDir() -> String {
-    let d = NSHomeDirectory() + "/Downloads/KBBridge"
-    try? FileManager.default.createDirectory(atPath: d, withIntermediateDirectories: true)
-    return d
-}
 
 func clipIsPrivate(_ pb: NSPasteboard) -> Bool {
     let types = pb.types ?? []
@@ -600,50 +594,32 @@ func sendLocalClipboard(_ pb: NSPasteboard, fd: Int32, opts: Options) {
     // 记账放在「确实发出去之后」：原来在开头就记，链路此刻不通的话这份内容
     // 会被标记成已发送，之后再也不会重发 —— 断链期间复制的东西就永久丢了。
 
-    // 优先按「文件」处理：这是搜狗唯一会降级的类型，也是最需要的
-    let urls = clipFileURLs(pb)
-    if !urls.isEmpty {
-        var msg: [String: Any] = ["t": "clip", "kind": "files"]
-        var n = 0
-        var total = 0
-        for u in urls.prefix(16) {
-            guard let attrs = try? FileManager.default.attributesOfItem(atPath: u.path),
-                  (attrs[.type] as? FileAttributeType) == .typeRegular,
-                  let size = attrs[.size] as? Int, size <= clipMaxBytes,
-                  total + size <= clipMaxTotal,
-                  let data = try? Data(contentsOf: u) else { continue }
-            msg["name\(n)"] = Data(u.lastPathComponent.utf8).base64EncodedString()
-            msg["data\(n)"] = data.base64EncodedString()
-            total += size
-            n += 1
-        }
-        if n > 0 {
-            msg["n"] = n
-            if sendLine(fd, msg) {
-                clipLastSentPrint = fp
-                clipSends += 1
-                if true { logLine("剪贴板 → Windows：\(n) 个文件（\(total) 字节）") }
-            }
-            return
-        }
+    // 「文件」不在本通道的能力范围内（1.4.1 起取消）：文件要落盘、要确认回执，
+    // 失败时还会在剪贴板上留下指向不存在文件的悬空路径，比不做更糟。
+    // 遇到文件就整条跳过 —— 尤其不能退回去发它的图标，那正是当初搜狗那个坑。
+    if !clipFileURLs(pb).isEmpty {
+        if opts.verbose { logLine("剪贴板里是文件，本通道不传文件，跳过") }
+        return
     }
-    // 其次图片
+
+    // 图片
     if let png = clipImagePNG(pb), png.count <= clipMaxBytes {
         if sendLine(fd, ["t": "clip", "kind": "image", "b64": png.base64EncodedString()]) {
             clipLastSentPrint = fp
             clipSends += 1
-            if true { logLine("剪贴板 → Windows：图片 \(png.count) 字节") }
+            logLine("剪贴板 → Windows：图片 \(png.count) 字节")
         }
         return
     }
-    // 最后纯文本
+
+    // 纯文本
     if let s = pb.string(forType: .string), !s.isEmpty, s.count <= clipMaxText {
         let b = Data(s.utf8).base64EncodedString()
         if b.count <= clipMaxBytes {
             if sendLine(fd, ["t": "clip", "kind": "text", "b64": b]) {
                 clipLastSentPrint = fp
                 clipSends += 1
-                if true { logLine("剪贴板 → Windows：文字 \(s.count) 字符") }
+                logLine("剪贴板 → Windows：文字 \(s.count) 字符")
             }
             return
         }
@@ -701,43 +677,10 @@ func applyRemoteClipboard(_ m: [String: Any], opts: Options) {
             detail = "图片 \(d.count) 字节"
         }
     case "files":
-        if let n = m["n"] as? Int, n > 0 {
-            let dir = clipReceiveDir()
-            var paths: [String] = []
-            for i in 0..<min(n, 32) {
-                guard let nameB64 = m["name\(i)"] as? String,
-                      let dataB64 = m["data\(i)"] as? String,
-                      let nameData = Data(base64Encoded: nameB64),
-                      let rawName = String(data: nameData, encoding: .utf8),
-                      let d = Data(base64Encoded: dataB64) else { continue }
-                let safeName = (rawName as NSString).lastPathComponent
-                if safeName.isEmpty || safeName == "." || safeName == ".." { continue }
-                var path = dir + "/" + safeName
-                var dup = 1
-                while FileManager.default.fileExists(atPath: path) {
-                    let base = (safeName as NSString).deletingPathExtension
-                    let ext = (safeName as NSString).pathExtension
-                    path = dir + "/" + base + "-\(dup)" + (ext.isEmpty ? "" : "." + ext)
-                    dup += 1
-                }
-                if (try? d.write(to: URL(fileURLWithPath: path))) != nil {
-                    paths.append(path)
-                }
-            }
-            if !paths.isEmpty {
-                // 用 NSPasteboardItem + public.file-url：writeObjects([NSURL]) 实测不可靠，
-                // 会静默什么都不写（剪贴板上拿不到 furl）。
-                var items: [NSPasteboardItem] = []
-                for p in paths {
-                    let it = NSPasteboardItem()
-                    it.setString(URL(fileURLWithPath: p).absoluteString, forType: .fileURL)
-                    items.append(it)
-                }
-                pb.clearContents()
-                ok = pb.writeObjects(items)
-                detail = "\(paths.count) 个文件 → \(dir)"
-            }
-        }
+        // 1.4.1 起不再支持文件传输。这里保留一条明确日志，
+        // 方便排查「对端还是旧版本」的情况，但不做任何落盘。
+        logLine("clip：收到文件报文，但本版本不支持文件传输，已忽略")
+        return
     default:
         logLine("clip：未知 kind=\(kind)")
         return
@@ -778,7 +721,7 @@ func handleClient(_ fd: Int32, opts: Options) {
             }
             peerName = (m["host"] as? String) ?? "?"
             if let cs = m["caps"] as? [String] { peerCaps = cs }
-            sendLine(fd, ["t": "hello_ok", "proto": 1, "agent": "mac", "version": "1.4.0",
+            sendLine(fd, ["t": "hello_ok", "proto": 1, "agent": "mac", "version": "1.4.1",
                           "caps": ["clip"]])
             authed = true
             break handshake
@@ -1353,7 +1296,7 @@ if opts.gui {
     exit(0)
 }
 
-logLine("KBBridge macOS agent 1.4.0")
+logLine("KBBridge macOS agent 1.4.1")
 
 if clickRewriteWanted(opts) { startClickRewrite(verbose: opts.verbose) }
 

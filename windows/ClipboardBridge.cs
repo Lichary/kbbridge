@@ -9,7 +9,7 @@
 //  所以这里用 KBBridge 自己的 TCP 通道传剪贴板，不经过任何第三方服务：
 //    {"t":"clip","kind":"text","b64":"<base64 utf8>"}
 //    {"t":"clip","kind":"image","b64":"<base64 png>"}
-//    {"t":"clip","kind":"files","n":2,"name0":"<b64>","data0":"<b64>",...}
+//    （1.4.1 起不再传文件：文件要落盘、要回执，失败还会留下悬空路径）
 //
 //  负载一律 base64：JSON 里只剩 [A-Za-z0-9+/=]，两端都能「扫到下一个引号」安全解析。
 //
@@ -187,31 +187,8 @@ namespace KBBridge
             return Convert.ToBase64String(Encoding.UTF8.GetBytes(s));
         }
 
-        static string ReceiveDir()
-        {
-            string d = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                "Downloads");
-            d = Path.Combine(d, "KBBridge");
-            Directory.CreateDirectory(d);
-            return d;
-        }
-
-        static string UniquePath(string dir, string name)
-        {
-            string path = Path.Combine(dir, name);
-            if (!File.Exists(path)) { return path; }
-            string baseName = Path.GetFileNameWithoutExtension(name);
-            string ext = Path.GetExtension(name);
-            int n = 1;
-            while (true)
-            {
-                string p = Path.Combine(dir, baseName + "-" + n + ext);
-                if (!File.Exists(p)) { return p; }
-                n++;
-            }
-        }
-
+        
+        
         // 内容指纹：判断"剪贴板里是不是我刚写过/刚发过的那份内容"
         static string Fingerprint()
         {
@@ -314,31 +291,11 @@ namespace KBBridge
             }
             else if (kind == "files")
             {
-                int n = IntField(line, "n", 0);
-                if (n > 0)
-                {
-                    string dir = ReceiveDir();
-                    StringCollection paths = new StringCollection();
-                    for (int i = 0; i < n && i < 32; i++)
-                    {
-                        string nb = Field(line, "name" + i);
-                        string db = Field(line, "data" + i);
-                        if (nb == null || db == null) { continue; }
-                        string name = Encoding.UTF8.GetString(Convert.FromBase64String(nb));
-                        // 只取文件名，防止对端塞进 ..\ 之类做路径穿越
-                        name = Path.GetFileName(name);
-                        if (name == null || name.Length == 0) { continue; }
-                        string path = UniquePath(dir, name);
-                        File.WriteAllBytes(path, Convert.FromBase64String(db));
-                        paths.Add(path);
-                    }
-                    if (paths.Count > 0)
-                    {
-                        Retry(delegate { Clipboard.SetFileDropList(paths); });
-                        ok = true;
-                        detail = paths.Count + " 个文件 -> " + dir;
-                    }
-                }
+                // 1.4.1 起不再支持文件传输：文件要落盘、要回执，失败时还会在剪贴板上
+                // 留下指向不存在文件的悬空路径，比不做更糟。这里保留一条明确日志，
+                // 方便排查「对端还是旧版本」的情况，但不做任何落盘、不动剪贴板。
+                Log("clip：收到文件报文，但本版本不支持文件传输，已忽略");
+                return;
             }
             else
             {
@@ -385,41 +342,10 @@ namespace KBBridge
             {
                 if (Clipboard.ContainsFileDropList())
                 {
-                    StringCollection c = Clipboard.GetFileDropList();
-                    List<string> names = new List<string>();
-                    List<byte[]> blobs = new List<byte[]>();
-                    long total = 0;
-                    for (int i = 0; i < c.Count && names.Count < 16; i++)
-                    {
-                        try
-                        {
-                            FileInfo fi = new FileInfo(c[i]);
-                            if (!fi.Exists || fi.Length > MaxBytes) { continue; }
-                            // 一条报文里所有文件的总量也要设上限：否则 16 个 8MiB 文件
-                            // 会拼出一条 128MiB 的 JSON 行，两端都要吃一次巨大的内存尖峰。
-                            if (total + fi.Length > MaxTotal) { continue; }
-                            total += fi.Length;
-                            names.Add(fi.Name);
-                            blobs.Add(File.ReadAllBytes(fi.FullName));
-                        }
-                        catch (Exception) { }
-                    }
-                    if (names.Count > 0)
-                    {
-                        StringBuilder sb = new StringBuilder();
-                        sb.Append("{\"t\":\"clip\",\"kind\":\"files\",\"n\":").Append(names.Count);
-                        for (int i = 0; i < names.Count; i++)
-                        {
-                            sb.Append(",\"name").Append(i).Append("\":\"").Append(B64(names[i])).Append('"');
-                            sb.Append(",\"data").Append(i).Append("\":\"")
-                              .Append(Convert.ToBase64String(blobs[i])).Append('"');
-                        }
-                        sb.Append('}');
-                        _sentPrint = Fingerprint();
-                        Send(sb.ToString());
-                        Log("剪贴板 -> Mac：" + names.Count + " 个文件");
-                        return;
-                    }
+                    // 「文件」不在本通道能力范围内（1.4.1 起取消）。整条跳过 ——
+                    // 尤其不能退回去发它的图标，那正是当初搜狗那个坑。
+                    Log("剪贴板里是文件，本通道不传文件，跳过");
+                    return;
                 }
 
                 if (Clipboard.ContainsImage())

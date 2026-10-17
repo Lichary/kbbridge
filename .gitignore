@@ -1,0 +1,26 @@
+# 编译产物
+dist/
+*.exe
+*.pdb
+*.dll
+
+# 便携包输出（里面有编译产物，不入库）
+kbbridge-portable/
+
+# 日志
+*.log
+
+# Python 缓存（tools/mock_mac_server.py）
+__pycache__/
+*.pyc
+
+# 配置与密钥：kbbridge.ini 和 token 里有共享密钥，绝对不要提交
+kbbridge.ini
+token
+.kbbridge/
+
+# 打包/同步产生的垃圾
+.DS_Store
+Thumbs.db
+desktop.ini
+*.zip

@@ -1,0 +1,16 @@
+# 统一换行符：避免在 Windows 上 clone 之后 shell 脚本变成 CRLF，拿到 macOS 上跑不了
+* text=auto
+
+*.sh      text eol=lf
+*.command text eol=lf
+*.swift   text eol=lf
+*.py    text eol=lf
+*.cs    text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.ps1   text eol=crlf
+*.cmd   text eol=crlf
+
+# 二进制文件（不收进仓库，但万一有也别乱改）
+*.exe   binary
+*.zip   binary

@@ -42,6 +42,8 @@ struct Options {
     var clickRewrite: Bool = false
     // 剪贴板通道（默认开）。--no-clip 关闭，用于只想用键盘、不想让剪贴板外发的情况。
     var clipSync: Bool = true
+    // 音量 HUD（默认开）。--no-volume-hud 关闭，只改音量不弹提示、不响提示音。
+    var volumeHUD: Bool = true
 }
 
 func printUsage() {
@@ -60,7 +62,8 @@ func printUsage() {
       --click-rewrite     实验性：让 Cmd/Shift+点击 生效（需「输入监控」权限）
                           默认关闭；也可用 KBBRIDGE_CLICK_REWRITE=1 或
                           ~/.kbbridge/click-rewrite 文件启用
-      --no-clip           关闭剪贴板同步（默认开启：文字/图片/文件 双向同步）
+      --no-clip           关闭剪贴板同步（默认开启：文字/图片 双向同步）
+      --no-volume-hud     调音量时不弹 HUD、不响提示音（默认会弹）
       -h, --help          显示帮助
     """)
 }
@@ -99,6 +102,8 @@ func parseArgs() -> Options {
             o.clickRewrite = true
         case "--no-clip":
             o.clipSync = false
+        case "--no-volume-hud":
+            o.volumeHUD = false
         case "-h", "--help":
             printUsage()
             exit(0)
@@ -263,9 +268,62 @@ func setOutputVolumeScalar(_ level: Float32) -> Bool {
 }
 
 /// 把音量增减 n 个百分点（n 可以是负数）
-func adjustOutputVolume(percent: Int) -> Bool {
+var volumeHUDEnabled = true
+
+/// 让 macOS 弹出音量 HUD 并播放「更改音量」的提示音。
+///
+/// 用 NX_SYSDEFINED 形式的媒体键事件（subtype 8 = NX_SUBTYPE_AUX_CONTROL_BUTTONS，
+/// data1 = (key << 16) | 0x0A00 按下 / 0x0B00 抬起）。
+/// 当初之所以完全不用事件而是直接改 Core Audio 标量，是因为实测普通 keyDown/keyUp
+/// 只会响一声、音量不动；而 NX_SYSDEFINED 才是系统真正认的媒体键形式。
+///
+/// 但要命的是：实测这个事件**自己也会把音量挪一格**
+/// （连发 3 次 up：64 -> 81；3 次 down：81 -> 63，约每格 5.7%）。
+/// 所以调用方必须在发完之后用 Core Audio 把目标值写回去，否则音量会一格一格漂。
+func postVolumeHUD(up: Bool) {
+    let key: Int32 = up ? 0 : 1                 // NX_KEYTYPE_SOUND_UP / _DOWN
+    for code in [Int32(0x0A00), Int32(0x0B00)] { // 按下、抬起
+        guard let ev = NSEvent.otherEvent(
+            with: .systemDefined,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            subtype: 8,
+            data1: Int(key << 16 | code),
+            data2: -1
+        ) else { return }
+        ev.cgEvent?.post(tap: .cghidEventTap)
+        usleep(15_000)
+    }
+}
+
+/// 把音量增减 n 个百分点（n 可以是负数）。
+/// 顺序很重要：先写目标值 -> 发 HUD（会挪一格）-> 立刻写回目标值抵消那一格。
+func adjustOutputVolume(percent: Int, hud: Bool) -> Bool {
     guard let cur = outputVolumeScalar() else { return false }
-    return setOutputVolumeScalar(cur + Float32(percent) / 100.0)
+    var target = cur + Float32(percent) / 100.0
+    target = max(0, min(1, target))
+    guard setOutputVolumeScalar(target) else { return false }
+    guard hud, percent != 0 else { return true }
+
+    // HUD 事件会自己把音量挪一格，而且系统是**异步**应用那格变化的
+    // —— 实测单次写回（25ms 后）会被系统那次变化盖掉，连续下调 3 次后
+    // 音量就比目标低了 5 个百分点。所以在一小段时间里反复写回目标值，
+    // 保证最后一次写入落在系统那次变化之后。
+    //
+    // 放后台线程：旋钮是连续转的，阻塞会话循环会让按键延迟肉眼可见。
+    postVolumeHUD(up: percent > 0)
+    let t = target
+    Thread.detachNewThread {
+        let deadline = Date().addingTimeInterval(0.40)
+        while Date() < deadline {
+            usleep(25_000)
+            _ = setOutputVolumeScalar(t)
+        }
+    }
+    return true
 }
 
 // ---------------------------------------------------------------------
@@ -721,7 +779,7 @@ func handleClient(_ fd: Int32, opts: Options) {
             }
             peerName = (m["host"] as? String) ?? "?"
             if let cs = m["caps"] as? [String] { peerCaps = cs }
-            sendLine(fd, ["t": "hello_ok", "proto": 1, "agent": "mac", "version": "1.4.1",
+            sendLine(fd, ["t": "hello_ok", "proto": 1, "agent": "mac", "version": "1.4.2",
                           "caps": ["clip"]])
             authed = true
             break handshake
@@ -787,7 +845,7 @@ func handleClient(_ fd: Int32, opts: Options) {
                     logLine("volume 报文缺少 delta: \(l)")
                     continue
                 }
-                if adjustOutputVolume(percent: d) {
+                if adjustOutputVolume(percent: d, hud: volumeHUDEnabled) {
                     if opts.verbose { logLine("音量 " + (d > 0 ? "+" : "") + "\(d)%") }
                 } else {
                     logLine("设置音量失败（当前输出设备可能不支持软件调音量）")
@@ -1270,6 +1328,7 @@ func runGuiMode(_ options: Options) {
         logLine("辅助功能权限: 未授权 ← 按键注入会被系统丢弃，点菜单栏图标授权")
     }
 
+    volumeHUDEnabled = o.volumeHUD
     if clickRewriteWanted(o) { startClickRewrite(verbose: o.verbose) }
 
     refreshMenu()
@@ -1296,7 +1355,8 @@ if opts.gui {
     exit(0)
 }
 
-logLine("KBBridge macOS agent 1.4.1")
+volumeHUDEnabled = opts.volumeHUD
+logLine("KBBridge macOS agent 1.4.2")
 
 if clickRewriteWanted(opts) { startClickRewrite(verbose: opts.verbose) }
 
@@ -1313,9 +1373,9 @@ if opts.volumeTest {
         exit(4)
     }
     logLine("当前音量 = " + String(format: "%.3f", before))
-    let okUp = adjustOutputVolume(percent: 5)
+    let okUp = adjustOutputVolume(percent: 5, hud: false)
     let mid = outputVolumeScalar()
-    let okDown = adjustOutputVolume(percent: -5)
+    let okDown = adjustOutputVolume(percent: -5, hud: false)
     let after = outputVolumeScalar()
     logLine("+5% -> " + (mid == nil ? "读取失败" : String(format: "%.3f", mid!)) + "   写入成功=" + (okUp ? "是" : "否"))
     logLine("-5% -> " + (after == nil ? "读取失败" : String(format: "%.3f", after!)) + "   写入成功=" + (okDown ? "是" : "否"))

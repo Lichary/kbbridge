@@ -35,7 +35,8 @@ if (-not $csc) { throw '找不到 .NET Framework 的 csc.exe' }
 $sources = @(
     (Join-Path $PSScriptRoot 'KBBridge.cs'),
     (Join-Path $PSScriptRoot 'KBBridgeSettings.cs'),
-    (Join-Path $PSScriptRoot 'VolumeBridge.cs')
+    (Join-Path $PSScriptRoot 'VolumeBridge.cs'),
+    (Join-Path $PSScriptRoot 'ClipboardBridge.cs')
 )
 foreach ($s in $sources) {
     if (-not (Test-Path $s)) { throw "找不到源文件: $s" }

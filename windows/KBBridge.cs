@@ -42,6 +42,7 @@ namespace KBBridge
         public bool VerboseKeys = false;
         // 键盘旋钮的音量调节是否跟着切换走（见 VolumeBridge.cs）
         public bool VolumeFollow = true;
+        public bool ClipSync = true;          // 剪贴板通道（文字/图片/文件 双向）
     }
 
     sealed class Hotkey
@@ -61,7 +62,7 @@ namespace KBBridge
 
     static class Program
     {
-        const string Version = "1.3.0";
+        const string Version = "1.4.0";
 
         // ---- Win32 常量 ----
         const int WH_KEYBOARD_LL = 13;
@@ -190,6 +191,8 @@ namespace KBBridge
             ClearStuckModifiers("启动自愈");
 
             if (_cfg.VolumeFollow) StartThread(new ThreadStart(VolumeBridge.WatchLoop), "volume");
+            ClipboardBridge.Enabled = _cfg.ClipSync;
+            ClipboardBridge.Start(SendRaw, Log);
 
             if (_cfg.Tray)
             {
@@ -213,6 +216,8 @@ namespace KBBridge
         static void Cleanup()
         {
             _running = false;
+            try { ClipboardBridge.Stop(); }
+            catch (Exception) { }
             try { SendRaw("{\"t\":\"bye\"}"); }
             catch (Exception) { }
             Thread.Sleep(150);
@@ -397,7 +402,7 @@ namespace KBBridge
                     backoff = 500;
 
                     SendRaw("{\"t\":\"hello\",\"proto\":1,\"token\":\"" + JsonEscape(_cfg.Token) +
-                            "\",\"client\":\"windows\",\"host\":\"" + JsonEscape(Environment.MachineName) + "\"}");
+                            "\",\"client\":\"windows\",\"caps\":[\"clip\"],\"host\":\"" + JsonEscape(Environment.MachineName) + "\"}");
                     Log("已连接 " + _cfg.MacHost + ":" + _cfg.Port + "，等待 hello_ok");
 
                     ReadLoop();
@@ -481,6 +486,11 @@ namespace KBBridge
                 return;
             }
             if (line.IndexOf("\"pong\"", StringComparison.Ordinal) >= 0) return;
+            if (line.IndexOf("\"clip\"", StringComparison.Ordinal) >= 0)
+            {
+                ClipboardBridge.Enqueue(line);
+                return;
+            }
             Log("未知报文: " + line);
         }
 
@@ -898,6 +908,7 @@ namespace KBBridge
                 case "rescuehotkey": _cfg.RescueHotkey = val; break;
                 case "verbosekeys": _cfg.VerboseKeys = ToBool(val, false); break;
                 case "volumefollow": _cfg.VolumeFollow = ToBool(val, true); break;
+                case "clipsync": _cfg.ClipSync = ToBool(val, true); break;
             }
         }
 

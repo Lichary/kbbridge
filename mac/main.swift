@@ -267,19 +267,35 @@ func setOutputVolumeScalar(_ level: Float32) -> Bool {
     return ok
 }
 
-/// 把音量增减 n 个百分点（n 可以是负数）
 var volumeHUDEnabled = true
 
-/// 让 macOS 弹出音量 HUD 并播放「更改音量」的提示音。
-///
-/// 用 NX_SYSDEFINED 形式的媒体键事件（subtype 8 = NX_SUBTYPE_AUX_CONTROL_BUTTONS，
-/// data1 = (key << 16) | 0x0A00 按下 / 0x0B00 抬起）。
-/// 当初之所以完全不用事件而是直接改 Core Audio 标量，是因为实测普通 keyDown/keyUp
-/// 只会响一声、音量不动；而 NX_SYSDEFINED 才是系统真正认的媒体键形式。
-///
-/// 但要命的是：实测这个事件**自己也会把音量挪一格**
-/// （连发 3 次 up：64 -> 81；3 次 down：81 -> 63，约每格 5.7%）。
-/// 所以调用方必须在发完之后用 Core Audio 把目标值写回去，否则音量会一格一格漂。
+// 音量：交给 macOS 自己改，我们不写 Core Audio。
+//
+// 走过两条弯路，记在这里免得以后又改回去：
+//
+// 1) 1.2.0：注入普通 keyDown/keyUp 音量键 —— 实测只会响一声、音量不动，
+//    所以改成直接写 Core Audio 标量。代价是没有 HUD、没有提示音。
+//
+// 2) 1.4.2/1.4.3：补发 NX_SYSDEFINED 让 HUD 出现。但这个事件**自己就会挪一格**，
+//    而且系统是**异步**应用那格变化的。我们先写目标值、再发 HUD、再反复写回目标值去
+//    抵消 —— 结果是竞态：转得快时，多条「写回」和系统排队的「挪格」抢同一个值，
+//    用户看到的正是「一直在调大、进度条反而回调」。实测档位轨迹
+//      [3,4,6,7,8,11,9,8,9,10,11,13,12,13]
+//    出现 11->9、9->8、13->12 这种回退，单线程写回也救不了。
+//
+// 3) 现在：既然 NX_SYSDEFINED 本来就能改音量，就别自己改了 —— 一次旋钮发一个
+//    媒体键事件，音量、HUD、提示音全部由 macOS 原生负责，同一个来源，物理上不会不一致。
+//    步进也就自然是 macOS 原生的 1/16。
+//
+// --no-volume-hud 时退回「静默改音量」：只写 Core Audio、不发事件，
+// 这样没有 HUD 也没有提示音，但音量步进是连续的（不是 16 级）。
+let volumeStepCount = 16
+
+/// 旋钮拧一格，Windows 侧发过来的 delta 是多少个百分点。
+/// 要和 Windows 侧保持一致（当前是 2）。只用来决定「一格发几个系统音量步」。
+let volumeDetentPercent = 2
+
+/// 发一次媒体键音量事件（按下 + 抬起），系统据此改一格音量并弹 HUD、响提示音。
 func postVolumeHUD(up: Bool) {
     let key: Int32 = up ? 0 : 1                 // NX_KEYTYPE_SOUND_UP / _DOWN
     for code in [Int32(0x0A00), Int32(0x0B00)] { // 按下、抬起
@@ -299,50 +315,24 @@ func postVolumeHUD(up: Bool) {
     }
 }
 
-/// macOS 的音量是固定的 16 级（0/6/13/19/25/31/38/44/50/56/63/69/75/81/88/94/100），
-/// HUD 就是按这 16 格画的。所以必须把音量**量化到 1/16 的整数倍**，
-/// 否则会出现「HUD 显示一格、实际音量是 6%」这种对不上的情况 —— 实测用户一眼就看出来了。
-let volumeStepCount = 16
-
-/// 旋钮拧一格，Windows 侧发过来的 delta 是多少个百分点。
-/// 要和 Windows 侧 kbbridge.ini / 代码里的档位保持一致（当前是 2）。
-let volumeDetentPercent = 2
+/// 静默改音量（--no-volume-hud 用）：只写 Core Audio，不发任何事件。
+func adjustOutputVolumeSilently(percent: Int) -> Bool {
+    guard let cur = outputVolumeScalar() else { return false }
+    var target = cur + Float32(percent) / 100.0
+    target = max(0, min(1, target))
+    return setOutputVolumeScalar(target)
+}
 
 /// 把音量按「格」增减。percent 的正负决定方向，绝对值决定几格。
-/// 顺序很重要：先写目标值 -> 发 HUD（会挪一格）-> 之后反复写回目标值抵消那一格。
 func adjustOutputVolume(percent: Int, hud: Bool) -> Bool {
-    guard let cur = outputVolumeScalar() else { return false }
     if percent == 0 { return true }
+    if !hud { return adjustOutputVolumeSilently(percent: percent) }
 
-    // 当前在第几格（四舍五入，避免读到 0.6399 这种浮点误差）
-    let curStep = Int((cur * Float32(volumeStepCount)).rounded())
-
-    // 这次要挪几格：delta 的绝对值除以每格对应的百分点，至少一格
     let raw = Double(abs(percent)) / Double(max(1, volumeDetentPercent))
-    var stepSize = Int(raw.rounded())
-    if stepSize < 1 { stepSize = 1 }
-
-    var targetStep = curStep + (percent > 0 ? stepSize : -stepSize)
-    targetStep = max(0, min(volumeStepCount, targetStep))
-    let target = Float32(targetStep) / Float32(volumeStepCount)
-    guard setOutputVolumeScalar(target) else { return false }
-
-    guard hud else { return true }
-
-    // HUD 事件会自己把音量挪一格，而且系统是**异步**应用那格变化的
-    // —— 实测单次写回（25ms 后）会被系统那次变化盖掉，连续下调 3 次后
-    // 音量就比目标低了 5 个百分点。所以在 0.4 秒里反复写回目标值，
-    // 保证最后一次写入落在系统那次变化之后。
-    // 放后台线程：旋钮是连续转的，阻塞会话循环会让按键延迟肉眼可见。
-    postVolumeHUD(up: percent > 0)
-    let t = target
-    Thread.detachNewThread {
-        let deadline = Date().addingTimeInterval(0.40)
-        while Date() < deadline {
-            usleep(25_000)
-            _ = setOutputVolumeScalar(t)
-        }
-    }
+    var steps = Int(raw.rounded())
+    if steps < 1 { steps = 1 }
+    if steps > 16 { steps = 16 }
+    for _ in 0..<steps { postVolumeHUD(up: percent > 0) }
     return true
 }
 
@@ -799,7 +789,7 @@ func handleClient(_ fd: Int32, opts: Options) {
             }
             peerName = (m["host"] as? String) ?? "?"
             if let cs = m["caps"] as? [String] { peerCaps = cs }
-            sendLine(fd, ["t": "hello_ok", "proto": 1, "agent": "mac", "version": "1.4.3",
+            sendLine(fd, ["t": "hello_ok", "proto": 1, "agent": "mac", "version": "1.4.4",
                           "caps": ["clip"]])
             authed = true
             break handshake
@@ -1376,7 +1366,7 @@ if opts.gui {
 }
 
 volumeHUDEnabled = opts.volumeHUD
-logLine("KBBridge macOS agent 1.4.3")
+logLine("KBBridge macOS agent 1.4.4")
 
 if clickRewriteWanted(opts) { startClickRewrite(verbose: opts.verbose) }
 

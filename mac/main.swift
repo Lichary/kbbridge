@@ -383,6 +383,7 @@ enum ReadResult {
     case timeout
     case closed
     case error
+    case tooLong          // 单行超过上限（防止对端发来一条巨型 JSON 把内存打爆）
 }
 
 final class LineReader {
@@ -393,9 +394,14 @@ final class LineReader {
         self.fd = fd
     }
 
+    // 单行上限：文件报文是 n 个文件拼成一行 JSON，对端已把总量压到 16 MiB，
+    // 这里留一倍余量。超过就断开，避免被一条巨型报文把内存打爆。
+    let maxLineBytes = 32 * 1024 * 1024
+
     func readLine(timeoutMs: Int32) -> ReadResult {
         let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000.0)
         while true {
+            if buf.count > maxLineBytes { return .tooLong }
             if let idx = buf.firstIndex(of: 0x0A) {
                 let lineBytes = Array(buf[0..<idx])
                 buf.removeFirst(idx + 1)
@@ -425,7 +431,8 @@ final class LineReader {
     }
 }
 
-func writeAll(_ fd: Int32, _ s: String) {
+@discardableResult
+func writeAll(_ fd: Int32, _ s: String) -> Bool {
     let bytes = Array(s.utf8)
     var off = 0
     while off < bytes.count {
@@ -433,20 +440,28 @@ func writeAll(_ fd: Int32, _ s: String) {
             guard let base = p.baseAddress else { return -1 }
             return Darwin.send(fd, base.advanced(by: off), bytes.count - off, 0)
         }
-        if n <= 0 { return }
+        if n <= 0 { return false }
         off += n
     }
+    return true
 }
 
 // 会话线程和菜单线程都会往同一个 fd 写，必须串行，否则两行 JSON 会交错。
 let sendLock = NSLock()
 
-func sendLine(_ fd: Int32, _ obj: [String: Any]) {
-    guard let data = try? JSONSerialization.data(withJSONObject: obj),
-          let s = String(data: data, encoding: .utf8) else { return }
+@discardableResult
+func sendLine(_ fd: Int32, _ obj: [String: Any]) -> Bool {
+    // .withoutEscapingSlashes 是必须的：Apple 的 JSONSerialization 默认把 '/' 写成 '\/'
+    // （实测：{"b64":"abc\/def=="}），而 base64 字母表里 '/' 极常见。
+    // PROTOCOL.md 约定「负载必须是纯 base64」，对端（Windows 侧手写 C# 5 解析）
+    // 是按「扫到下一个引号就结束」取值的 —— 被转义过的串会让 Convert.FromBase64String 抛异常。
+    // 实测这个 bug 上线 2 秒就复现过，所以从源头保证线上格式严格符合协议。
+    let opts: JSONSerialization.WritingOptions = [.withoutEscapingSlashes]
+    guard let data = try? JSONSerialization.data(withJSONObject: obj, options: opts),
+          let s = String(data: data, encoding: .utf8) else { return false }
     sendLock.lock()
     defer { sendLock.unlock() }
-    writeAll(fd, s + "\n")
+    return writeAll(fd, s + "\n")
 }
 
 func parseJSON(_ line: String) -> [String: Any]? {
@@ -510,6 +525,7 @@ func makeListener(bind: String, port: UInt16) -> Int32? {
 //  隐私：带 Concealed / Transient 标记的剪贴板（密码管理器、临时内容）一律不同步。
 // =====================================================================
 let clipMaxBytes = 8 * 1024 * 1024      // 单个文件/图片上限
+let clipMaxTotal = 16 * 1024 * 1024     // 一次多文件的总量上限（对端也按 16 MiB 压）
 let clipMaxText  = 100_000              // 文本上限（字符）
 var clipSyncEnabled = true
 var clipLastChange = -1                 // 上一次看到的 changeCount
@@ -547,13 +563,24 @@ func clipFileURLs(_ pb: NSPasteboard) -> [URL] {
     return objs.map { $0 as URL }.filter { $0.isFileURL }
 }
 
+// 取剪贴板里的图片并统一成 PNG。
+// 不能只试 .png：别的程序（比如 Finder、截图工具）可能只放 .tiff，
+// 这时 data(forType:.png) 返回 nil，图片就永远发不出去 —— 实测踩到过。
+func clipImagePNG(_ pb: NSPasteboard) -> Data? {
+    if let d = pb.data(forType: .png) { return d }
+    if let tiff = pb.data(forType: .tiff), let rep = NSBitmapImageRep(data: tiff) {
+        return rep.representation(using: .png, properties: [:])
+    }
+    return nil
+}
+
 // 内容指纹：判断"剪贴板里是不是我刚写过 / 刚发过的那份内容"
 func clipFingerprint(_ pb: NSPasteboard) -> String {
     let urls = clipFileURLs(pb)
     if !urls.isEmpty {
         return "files:" + urls.map { $0.path }.joined(separator: "|")
     }
-    if let png = pb.data(forType: .png) {
+    if let png = clipImagePNG(pb) {
         var h: UInt64 = 1469598103934665603
         for b in png { h = (h ^ UInt64(b)) &* 1099511628211 }
         return "image:\(png.count):\(h)"
@@ -569,44 +596,55 @@ func clipFingerprint(_ pb: NSPasteboard) -> String {
 // 负载一律 base64：这样 JSON 里只剩下 [A-Za-z0-9+/=]，不会出现引号/换行/反斜杠，
 // 两端都能用「扫到下一个引号」的方式安全解析（Windows 侧是手写的 C# 5 解析）。
 func sendLocalClipboard(_ pb: NSPasteboard, fd: Int32, opts: Options) {
-    clipLastSentPrint = clipFingerprint(pb)
+    let fp = clipFingerprint(pb)
+    // 记账放在「确实发出去之后」：原来在开头就记，链路此刻不通的话这份内容
+    // 会被标记成已发送，之后再也不会重发 —— 断链期间复制的东西就永久丢了。
 
     // 优先按「文件」处理：这是搜狗唯一会降级的类型，也是最需要的
     let urls = clipFileURLs(pb)
     if !urls.isEmpty {
         var msg: [String: Any] = ["t": "clip", "kind": "files"]
         var n = 0
+        var total = 0
         for u in urls.prefix(16) {
             guard let attrs = try? FileManager.default.attributesOfItem(atPath: u.path),
                   (attrs[.type] as? FileAttributeType) == .typeRegular,
                   let size = attrs[.size] as? Int, size <= clipMaxBytes,
+                  total + size <= clipMaxTotal,
                   let data = try? Data(contentsOf: u) else { continue }
             msg["name\(n)"] = Data(u.lastPathComponent.utf8).base64EncodedString()
             msg["data\(n)"] = data.base64EncodedString()
+            total += size
             n += 1
         }
         if n > 0 {
             msg["n"] = n
-            sendLine(fd, msg)
-            clipSends += 1
-            if opts.verbose { logLine("剪贴板 → Windows：\(n) 个文件") }
+            if sendLine(fd, msg) {
+                clipLastSentPrint = fp
+                clipSends += 1
+                if true { logLine("剪贴板 → Windows：\(n) 个文件（\(total) 字节）") }
+            }
             return
         }
     }
     // 其次图片
-    if let png = pb.data(forType: .png), png.count <= clipMaxBytes {
-        sendLine(fd, ["t": "clip", "kind": "image", "b64": png.base64EncodedString()])
-        clipSends += 1
-        if opts.verbose { logLine("剪贴板 → Windows：图片 \(png.count) 字节") }
+    if let png = clipImagePNG(pb), png.count <= clipMaxBytes {
+        if sendLine(fd, ["t": "clip", "kind": "image", "b64": png.base64EncodedString()]) {
+            clipLastSentPrint = fp
+            clipSends += 1
+            if true { logLine("剪贴板 → Windows：图片 \(png.count) 字节") }
+        }
         return
     }
     // 最后纯文本
     if let s = pb.string(forType: .string), !s.isEmpty, s.count <= clipMaxText {
         let b = Data(s.utf8).base64EncodedString()
         if b.count <= clipMaxBytes {
-            sendLine(fd, ["t": "clip", "kind": "text", "b64": b])
-            clipSends += 1
-            if opts.verbose { logLine("剪贴板 → Windows：文字 \(s.count) 字符") }
+            if sendLine(fd, ["t": "clip", "kind": "text", "b64": b]) {
+                clipLastSentPrint = fp
+                clipSends += 1
+                if true { logLine("剪贴板 → Windows：文字 \(s.count) 字符") }
+            }
             return
         }
     }
@@ -618,9 +656,16 @@ func clipPollOnce(fd: Int32, opts: Options) {
     let cc = pb.changeCount
     if cc == clipLastChange { return }
 
-    let fp = clipFingerprint(pb)
+    var fp = clipFingerprint(pb)
     // 拿不到内容说明正好撞上「clearContents 之后、写入之前」的瞬时状态。
-    // 这时不能记录 changeCount，否则真正的内容永远不会被发送 —— 下一轮再看。
+    // 这时不能记录 changeCount（否则真正的内容永远不会被发送），也不要干等下一轮
+    // （下一轮是 1 秒后，极端情况下会漏掉一次复制）—— 就地短暂重试。
+    var tries = 0
+    while fp.isEmpty && tries < 4 {
+        usleep(40_000)
+        fp = clipFingerprint(pb)
+        tries += 1
+    }
     if fp.isEmpty { return }
     clipLastChange = cc
 
@@ -643,7 +688,7 @@ func applyRemoteClipboard(_ m: [String: Any], opts: Options) {
     switch kind {
     case "text":
         if let b64 = m["b64"] as? String, let d = Data(base64Encoded: b64),
-           let s = String(data: d, encoding: .utf8), !s.isEmpty {
+           let s = String(data: d, encoding: .utf8), !s.isEmpty, s.count <= clipMaxText {
             pb.clearContents()
             ok = pb.setString(s, forType: .string)
             detail = "文字 \(s.count) 字符"
@@ -733,7 +778,7 @@ func handleClient(_ fd: Int32, opts: Options) {
             }
             peerName = (m["host"] as? String) ?? "?"
             if let cs = m["caps"] as? [String] { peerCaps = cs }
-            sendLine(fd, ["t": "hello_ok", "proto": 1, "agent": "mac", "version": "1.3.0",
+            sendLine(fd, ["t": "hello_ok", "proto": 1, "agent": "mac", "version": "1.4.0",
                           "caps": ["clip"]])
             authed = true
             break handshake
@@ -745,6 +790,9 @@ func handleClient(_ fd: Int32, opts: Options) {
             break handshake
         case .error:
             logLine("握手读取错误 errno=\(errno)")
+            break handshake
+        case .tooLong:
+            logLine("握手读取超长，断开")
             break handshake
         }
     }
@@ -831,6 +879,9 @@ func handleClient(_ fd: Int32, opts: Options) {
             running = false
         case .error:
             logLine("读取错误 errno=\(errno)")
+            running = false
+        case .tooLong:
+            logLine("单行报文超过 32 MiB 上限，断开连接")
             running = false
         }
     }
@@ -1302,7 +1353,7 @@ if opts.gui {
     exit(0)
 }
 
-logLine("KBBridge macOS agent 1.3.0")
+logLine("KBBridge macOS agent 1.4.0")
 
 if clickRewriteWanted(opts) { startClickRewrite(verbose: opts.verbose) }
 

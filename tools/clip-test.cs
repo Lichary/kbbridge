@@ -80,11 +80,10 @@ namespace KBBridge
             Check("能解出原文（本次修复点）", got2 == text, got2);
 
             Console.WriteLine();
-            Console.WriteLine("== 4. 路径穿越：name 里塞 ..\\..\\evil.txt ==");
+            Console.WriteLine("== 4. 文件报文：1.4.1 起取消文件传输，应被忽略（不落盘、不动剪贴板） ==");
             string dir = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
                 "Downloads", "KBBridge");
-            Directory.CreateDirectory(dir);
             string target = Path.Combine(dir, "evil.txt");
             try { if (File.Exists(target)) { File.Delete(target); } } catch (Exception) { }
 
@@ -92,10 +91,9 @@ namespace KBBridge
             string db = Convert.ToBase64String(Encoding.UTF8.GetBytes("payload")).Replace("/", "\\/");
             Clipboard.Clear();
             Apply("{\"t\":\"clip\",\"kind\":\"files\",\"n\":1,\"name0\":\"" + nb + "\",\"data0\":\"" + db + "\"}");
-            bool inside = File.Exists(target);
-            Check("文件落在 KBBridge 目录内（穿越被削平）", inside, inside ? target : "(没生成)");
-            Check("剪贴板设成了文件列表", Clipboard.ContainsFileDropList(), "");
-            try { if (inside) { File.Delete(target); } } catch (Exception) { }
+            Check("没有落盘任何文件（含路径穿越的 evil.txt）", !File.Exists(target), target);
+            Check("剪贴板没有被改成文件列表", !Clipboard.ContainsFileDropList(), "");
+            Check("剪贴板也没有被写入文字", !Clipboard.ContainsText(), "");
 
             Console.WriteLine();
             Console.WriteLine("== 5. 大文本（超过 100000 字符上限应被跳过） ==");

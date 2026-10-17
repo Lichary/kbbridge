@@ -62,7 +62,7 @@ namespace KBBridge
 
     static class Program
     {
-        const string Version = "1.4.1";
+        const string Version = "1.4.4";
 
         // ---- Win32 常量 ----
         const int WH_KEYBOARD_LL = 13;

@@ -598,7 +598,7 @@ func sendLocalClipboard(_ pb: NSPasteboard, fd: Int32, opts: Options) {
     // 失败时还会在剪贴板上留下指向不存在文件的悬空路径，比不做更糟。
     // 遇到文件就整条跳过 —— 尤其不能退回去发它的图标，那正是当初搜狗那个坑。
     if !clipFileURLs(pb).isEmpty {
-        if opts.verbose { logLine("剪贴板里是文件，本通道不传文件，跳过") }
+        logLine("剪贴板里是文件，本通道不传文件，跳过")
         return
     }
 

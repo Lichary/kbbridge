@@ -299,20 +299,40 @@ func postVolumeHUD(up: Bool) {
     }
 }
 
-/// 把音量增减 n 个百分点（n 可以是负数）。
-/// 顺序很重要：先写目标值 -> 发 HUD（会挪一格）-> 立刻写回目标值抵消那一格。
+/// macOS 的音量是固定的 16 级（0/6/13/19/25/31/38/44/50/56/63/69/75/81/88/94/100），
+/// HUD 就是按这 16 格画的。所以必须把音量**量化到 1/16 的整数倍**，
+/// 否则会出现「HUD 显示一格、实际音量是 6%」这种对不上的情况 —— 实测用户一眼就看出来了。
+let volumeStepCount = 16
+
+/// 旋钮拧一格，Windows 侧发过来的 delta 是多少个百分点。
+/// 要和 Windows 侧 kbbridge.ini / 代码里的档位保持一致（当前是 2）。
+let volumeDetentPercent = 2
+
+/// 把音量按「格」增减。percent 的正负决定方向，绝对值决定几格。
+/// 顺序很重要：先写目标值 -> 发 HUD（会挪一格）-> 之后反复写回目标值抵消那一格。
 func adjustOutputVolume(percent: Int, hud: Bool) -> Bool {
     guard let cur = outputVolumeScalar() else { return false }
-    var target = cur + Float32(percent) / 100.0
-    target = max(0, min(1, target))
+    if percent == 0 { return true }
+
+    // 当前在第几格（四舍五入，避免读到 0.6399 这种浮点误差）
+    let curStep = Int((cur * Float32(volumeStepCount)).rounded())
+
+    // 这次要挪几格：delta 的绝对值除以每格对应的百分点，至少一格
+    let raw = Double(abs(percent)) / Double(max(1, volumeDetentPercent))
+    var stepSize = Int(raw.rounded())
+    if stepSize < 1 { stepSize = 1 }
+
+    var targetStep = curStep + (percent > 0 ? stepSize : -stepSize)
+    targetStep = max(0, min(volumeStepCount, targetStep))
+    let target = Float32(targetStep) / Float32(volumeStepCount)
     guard setOutputVolumeScalar(target) else { return false }
-    guard hud, percent != 0 else { return true }
+
+    guard hud else { return true }
 
     // HUD 事件会自己把音量挪一格，而且系统是**异步**应用那格变化的
     // —— 实测单次写回（25ms 后）会被系统那次变化盖掉，连续下调 3 次后
-    // 音量就比目标低了 5 个百分点。所以在一小段时间里反复写回目标值，
+    // 音量就比目标低了 5 个百分点。所以在 0.4 秒里反复写回目标值，
     // 保证最后一次写入落在系统那次变化之后。
-    //
     // 放后台线程：旋钮是连续转的，阻塞会话循环会让按键延迟肉眼可见。
     postVolumeHUD(up: percent > 0)
     let t = target
@@ -779,7 +799,7 @@ func handleClient(_ fd: Int32, opts: Options) {
             }
             peerName = (m["host"] as? String) ?? "?"
             if let cs = m["caps"] as? [String] { peerCaps = cs }
-            sendLine(fd, ["t": "hello_ok", "proto": 1, "agent": "mac", "version": "1.4.2",
+            sendLine(fd, ["t": "hello_ok", "proto": 1, "agent": "mac", "version": "1.4.3",
                           "caps": ["clip"]])
             authed = true
             break handshake
@@ -1356,7 +1376,7 @@ if opts.gui {
 }
 
 volumeHUDEnabled = opts.volumeHUD
-logLine("KBBridge macOS agent 1.4.2")
+logLine("KBBridge macOS agent 1.4.3")
 
 if clickRewriteWanted(opts) { startClickRewrite(verbose: opts.verbose) }
 

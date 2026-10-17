@@ -41,6 +41,7 @@ namespace KBBridge
         static extern uint GetClipboardSequenceNumber();
 
         const int MaxBytes = 8 * 1024 * 1024;   // 单个文件/图片上限
+        const long MaxTotal = 16L * 1024 * 1024; // 一条 files 报文的总量上限
         const int MaxText  = 100000;            // 文本上限（字符）
 
         static volatile bool _running = false;
@@ -114,7 +115,12 @@ namespace KBBridge
                 }
                 if (line == null) { return; }
                 try { Apply(line); }
-                catch (Exception ex) { Log("clip 应用异常: " + ex.Message); }
+                catch (Exception ex)
+                {
+                    // 打点：光有异常消息定位不了问题（这次就是），把报文长度和头部带上
+                    Log("clip 应用异常: " + ex.Message
+                        + "（长度 " + (line == null ? 0 : line.Length) + "，头部 " + Head(line, 120) + "）");
+                }
             }
         }
 
@@ -130,7 +136,36 @@ namespace KBBridge
             i += pat.Length;
             int j = s.IndexOf('"', i);
             if (j < 0) { return null; }
-            return s.Substring(i, j - i);
+            string v = s.Substring(i, j - i);
+            // 关键：Apple 的 JSONSerialization 会把 '/' 转义成 "\/"，而 base64 里
+            // '/' 极常见（它是字母表的一员），于是每条报文都会带上这个转义。
+            // 协议约定"负载必须是纯 base64 字符集"，所以这里做一次还原；
+            // 不还原的话 Convert.FromBase64String 必然抛"包含非 base64 字符"。
+            if (v.IndexOf('\\') >= 0) { v = v.Replace("\\/", "/"); }
+            return v;
+        }
+
+        static string Head(string s, int n)
+        {
+            if (s == null) { return ""; }
+            return s.Length <= n ? s : s.Substring(0, n) + "...";
+        }
+
+        // 剪贴板是全局独占资源：任何程序 OpenClipboard 期间别人都写不进去。
+        // 搜狗这类"跨设备剪贴板"恰恰靠高频轮询实现，所以写入随时可能抛
+        // "OpenClipboard 失败"（实测：并发轮询时自测就会偶发失败）。
+        // 写操作统一带几次重试，否则一条报文会被静默丢掉。
+        static void Retry(Action act)
+        {
+            for (int i = 0; ; i++)
+            {
+                try { act(); return; }
+                catch (Exception)
+                {
+                    if (i >= 4) { throw; }
+                    Thread.Sleep(40);
+                }
+            }
         }
 
         static int IntField(string s, string key, int def)
@@ -250,7 +285,7 @@ namespace KBBridge
                     string s = Encoding.UTF8.GetString(Convert.FromBase64String(b));
                     if (s.Length > 0)
                     {
-                        Clipboard.SetText(s);
+                        Retry(delegate { Clipboard.SetText(s); });
                         ok = true;
                         detail = "文字 " + s.Length + " 字符";
                     }
@@ -268,9 +303,9 @@ namespace KBBridge
                         // 必须复制一份：Image.FromStream 的图依赖那个流，流关掉剪贴板就坏了
                         using (Bitmap copy = new Bitmap(tmp))
                         {
-                            // 用 SetDataObject(copy:true)：数据被真正复制进剪贴板，
-                            // 之后 dispose 这个 Bitmap 不会让粘贴出来的图变空白。
-                            Clipboard.SetDataObject(copy, true);
+                        // 用 SetDataObject(copy:true)：数据被真正复制进剪贴板，
+                        // 之后 dispose 这个 Bitmap 不会让粘贴出来的图变空白。
+                        Retry(delegate { Clipboard.SetDataObject(copy, true); });
                         }
                     }
                     ok = true;
@@ -299,7 +334,7 @@ namespace KBBridge
                     }
                     if (paths.Count > 0)
                     {
-                        Clipboard.SetFileDropList(paths);
+                        Retry(delegate { Clipboard.SetFileDropList(paths); });
                         ok = true;
                         detail = paths.Count + " 个文件 -> " + dir;
                     }
@@ -353,12 +388,17 @@ namespace KBBridge
                     StringCollection c = Clipboard.GetFileDropList();
                     List<string> names = new List<string>();
                     List<byte[]> blobs = new List<byte[]>();
+                    long total = 0;
                     for (int i = 0; i < c.Count && names.Count < 16; i++)
                     {
                         try
                         {
                             FileInfo fi = new FileInfo(c[i]);
                             if (!fi.Exists || fi.Length > MaxBytes) { continue; }
+                            // 一条报文里所有文件的总量也要设上限：否则 16 个 8MiB 文件
+                            // 会拼出一条 128MiB 的 JSON 行，两端都要吃一次巨大的内存尖峰。
+                            if (total + fi.Length > MaxTotal) { continue; }
+                            total += fi.Length;
                             names.Add(fi.Name);
                             blobs.Add(File.ReadAllBytes(fi.FullName));
                         }
